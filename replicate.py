@@ -36,6 +36,7 @@ Run from the project folder:
     uv run python replicate.py --n_layers 1 --n_loops 2               # looped twin
     uv run python replicate.py --n_layers 2 --n_loops 1 --no_mlp      # and so on down the ladder
     uv run python replicate.py --bf16 ...                             # faster on a CUDA GPU
+    uv run python replicate.py --ckpt_phases 0.03,0.1,0.25 ...        # save only 4 checkpoints (below)
 Quick CPU test:
     uv run python replicate.py --data_tokens 3000000 --d_model 64 --ctx 128 --batch_size 8 \
         --max_tokens 200000 --eval_every 50 --device cpu --run_name smoke_rep
@@ -44,6 +45,11 @@ Each run writes to checkpoints/<run_name>/:
     train_args.json  the arguments (load_run rebuilds the model from these)
     metrics.jsonl    one line per evaluation, including every head's induction and previous-token score
     step_XXXXXX.pt   saved weights at the --ckpt_mtokens milestones and at the end
+With --ckpt_phases PRE,ONSET,MID, the checkpoints are chosen by the induction score instead:
+pre-formation (the last of the saves made every --latest_mtokens before the score first exceeds
+PRE), onset (first evaluation above ONSET), mid-transition (first above MID) and the end.
+phases.json maps each of these labels to its step; latest.pt is the pre-formation candidate
+while the run is still before the crossing.
 """
 
 import argparse
@@ -258,6 +264,46 @@ def evaluate(model, val_rows, ps_tokens, args, device) -> dict:
             "prev": [[round(s, 4) for s in row] for row in prev]}
 
 
+# ---------------------------------------------------------------- phase checkpoints
+
+class PhaseCheckpointer:
+    """Decides, from the induction score at each evaluation, which checkpoints to save.
+
+    pre-formation: the induction score's crossing of pre_threshold can't be foreseen, so a single
+        "latest" checkpoint is kept, overwritten every rolling_steps; at the crossing it is kept
+        for good (renamed), and no more "latest" saves happen.
+    onset, mid-transition: saved at the first evaluation whose score exceeds their threshold.
+    (end is saved by the training loop.)
+
+    update() only returns actions, (kind, label, step), so it can be tested without a model:
+        ("save_latest", None, step)        overwrite the latest checkpoint
+        ("keep_latest", label, its_step)   keep the latest checkpoint under its step's name
+        ("save", label, step)              save a checkpoint now
+    """
+
+    def __init__(self, pre_threshold: float, thresholds: dict[str, float], rolling_steps: int):
+        self.pre_threshold, self.thresholds, self.rolling_steps = pre_threshold, thresholds, rolling_steps
+        self.latest_step: int | None = None
+        self.pre_done = False
+        self.done: set[str] = set()
+
+    def update(self, step: int, ind: float) -> list[tuple[str, str | None, int]]:
+        actions = []
+        if not self.pre_done:
+            if ind > self.pre_threshold:
+                self.pre_done = True
+                if self.latest_step is not None:
+                    actions.append(("keep_latest", "pre-formation", self.latest_step))
+            elif self.latest_step is None or step - self.latest_step >= self.rolling_steps:
+                self.latest_step = step
+                actions.append(("save_latest", None, step))
+        for label, threshold in self.thresholds.items():
+            if label not in self.done and ind > threshold:
+                self.done.add(label)
+                actions.append(("save", label, step))
+        return actions
+
+
 # ---------------------------------------------------------------- main
 
 def get_device(name):
@@ -291,6 +337,11 @@ def main():
     p.add_argument("--val_rows", type=int, default=32)
     p.add_argument("--ckpt_mtokens", default="5,10,20,30,40,50,60,80,100",
                    help="save weights after these many million tokens (and at the end)")
+    p.add_argument("--ckpt_phases", default=None,
+                   help="instead of --ckpt_mtokens: three induction-score thresholds, e.g. 0.03,0.1,0.25, "
+                        "giving pre-formation, onset and mid-transition checkpoints (plus the end)")
+    p.add_argument("--latest_mtokens", type=float, default=5,
+                   help="with --ckpt_phases: how often the pre-formation candidate is overwritten")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--bf16", action="store_true", help="bfloat16 autocast (CUDA only)")
     p.add_argument("--device", default=None)
@@ -336,7 +387,25 @@ def main():
     scheduler = get_cosine_schedule_with_warmup(optimizer, int(schedule_steps * 0.01), schedule_steps)
 
     ps_tokens = make_ps_tokens()
-    ckpt_steps = {int(float(m) * 1e6 // tokens_per_step) for m in args.ckpt_mtokens.split(",")} | {max_steps}
+    if args.ckpt_phases:
+        pre, onset, mid = (float(x) for x in args.ckpt_phases.split(","))
+        phaser = PhaseCheckpointer(pre, {"onset": onset, "mid-transition": mid},
+                                   int(args.latest_mtokens * 1e6 // tokens_per_step))
+        ckpt_steps = {max_steps}
+    else:
+        phaser = None
+        ckpt_steps = {int(float(m) * 1e6 // tokens_per_step) for m in args.ckpt_mtokens.split(",")} | {max_steps}
+    phases = {}   # label -> step, written to phases.json
+
+    def save(path):
+        sd = model.state_dict()
+        check_tied_state(sd, args)
+        t.save({"step": step, "state_dict": sd}, path)
+
+    def record(label, s):
+        phases[label] = s
+        (run_dir / "phases.json").write_text(json.dumps(phases, indent=2))
+
     gen = t.Generator().manual_seed(args.seed)
     order, pos = t.randperm(len(train_rows), generator=gen), 0
     metrics_file = open(run_dir / "metrics.jsonl", "w")
@@ -353,10 +422,21 @@ def main():
                   f"val {m['val_loss']:.3f} | induction {m['ind_max']:.3f} ({m['ind_head']}) | "
                   f"prev-token {m['prev_max']:.3f} | rep loss {m['rep_first_half']:.2f} -> "
                   f"{m['rep_second_half']:.2f} | {m['minutes']:.1f} min", flush=True)
+            for kind, label, s in (phaser.update(step, m["ind_max"]) if phaser else []):
+                if kind == "save_latest":
+                    save(run_dir / "latest.pt")
+                elif kind == "keep_latest":
+                    (run_dir / "latest.pt").rename(run_dir / f"step_{s:06d}.pt")
+                    record(label, s)
+                else:
+                    save(run_dir / f"step_{s:06d}.pt")
+                    record(label, s)
+                print(f"  checkpoint: {kind} {label or ''} at step {s}", flush=True)
         if step in ckpt_steps:
-            sd = model.state_dict()
-            check_tied_state(sd, args)
-            t.save({"step": step, "state_dict": sd}, run_dir / f"step_{step:06d}.pt")
+            save(run_dir / f"step_{step:06d}.pt")
+            if phaser:
+                record("end", step)
+                (run_dir / "latest.pt").unlink(missing_ok=True)   # never needed: no crossing happened
         if step == max_steps:
             break
 
