@@ -67,6 +67,9 @@ class Attention(nn.Module):
         nn.init.normal_(self.W_V, std=self.cfg.init_range)
         nn.init.normal_(self.W_O, std=self.cfg.init_range)
         self.register_buffer("IGNORE", t.tensor(float("-inf"), dtype=t.float32))
+        # Set to a list to record attention patterns (replicate.py does this); None = off.
+        # All blocks can share one list, so a looped block records once per loop, in order.
+        self.pattern_store: list | None = None
 
     def forward(self, resid_pre: Float[Tensor, "batch posn d_model"], pos_emb: Float[Tensor, "batch posn d_model"]) -> Float[Tensor, "batch posn d_model"]:
 
@@ -93,6 +96,8 @@ class Attention(nn.Module):
         #Attn scores scaled by 1/(d_head)^0.5, causally masked
         attn_scores_masked=self.apply_causal_mask(attn_scores/(self.cfg.d_head**0.5))
         attn_prob=attn_scores_masked.softmax(-1)
+        if self.pattern_store is not None:
+            self.pattern_store.append(attn_prob.detach())
 
         #applying attn prob to values
         weighted_val=einops.einsum(
