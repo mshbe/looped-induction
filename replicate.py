@@ -65,6 +65,8 @@ import torch as t
 import torch.nn.functional as F
 from torch import nn
 from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel, get_cosine_schedule_with_warmup
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+from transformers.pytorch_utils import Conv1D
 
 from model import Config, LoopedAttnOnly
 
@@ -127,6 +129,25 @@ def load_rows(path: Path, ctx: int) -> tuple[t.Tensor, t.Tensor]:
 
 # ---------------------------------------------------------------- models
 
+class NarrowGPT2Attention(GPT2Attention):
+    """GPT-2 attention with n_heads * d_head != d_model (e.g. 4 heads of 96 in a 768-wide model).
+
+    Hugging Face's forward pass reads head_dim and split_size from the module, so only the
+    projections change: d_model -> 3 * n_heads * d_head, and n_heads * d_head -> d_model.
+    Initialized as GPT-2 does: std 0.02, output projection scaled by 1/sqrt(2 * n_layer), zero bias.
+    """
+    def __init__(self, config, layer_idx, n_heads, d_head):
+        super().__init__(config, layer_idx=layer_idx)
+        inner = n_heads * d_head
+        self.num_heads, self.head_dim, self.split_size = n_heads, d_head, inner
+        self.c_attn = Conv1D(3 * inner, self.embed_dim)
+        self.c_proj = Conv1D(self.embed_dim, inner)
+        for conv, std in [(self.c_attn, config.initializer_range),
+                          (self.c_proj, config.initializer_range / math.sqrt(2 * config.n_layer))]:
+            nn.init.normal_(conv.weight, std=std)
+            nn.init.zeros_(conv.bias)
+
+
 class ZeroMLP(nn.Module):
     """Stands in for a removed MLP: the block then adds nothing after attention."""
     def forward(self, x):
@@ -137,19 +158,23 @@ def build_model(args) -> nn.Module:
     """The model described by args, with block i of the unrolled stack tied to block i % n_layers."""
     t.manual_seed(args.seed)
     n_blocks = args.n_layers * args.n_loops
+    d_head = getattr(args, "d_head", None) or args.d_model // args.n_heads   # older runs lack these args
+    d_mlp = getattr(args, "d_mlp", None)
     if args.arch == "mine":
-        cfg = Config(d_model=args.d_model, d_vocab=VOCAB, n_ctx=args.ctx, d_head=args.d_model // args.n_heads,
+        cfg = Config(d_model=args.d_model, d_vocab=VOCAB, n_ctx=args.ctx, d_head=d_head,
                      n_heads=args.n_heads, n_layers=args.n_layers, n_loops=args.n_loops, tokenizer_name="gpt2")
         return LoopedAttnOnly(cfg)
 
     # n_layer is the unrolled depth, so GPT-2's init (which scales some weights by depth) treats
     # the looped twin and the control the same way
     cfg = GPT2Config(vocab_size=VOCAB, n_positions=args.ctx, n_embd=args.d_model, n_layer=n_blocks,
-                     n_head=args.n_heads, resid_pdrop=args.dropout, embd_pdrop=args.dropout,
+                     n_head=args.n_heads, n_inner=d_mlp, resid_pdrop=args.dropout, embd_pdrop=args.dropout,
                      attn_pdrop=args.dropout, bos_token_id=EOS, eos_token_id=EOS, use_cache=False)
     model = GPT2LMHeadModel(cfg)
     blocks = model.transformer.h
-    for b in blocks:
+    for i, b in enumerate(blocks):
+        if args.n_heads * d_head != args.d_model:
+            b.attn = NarrowGPT2Attention(cfg, i, args.n_heads, d_head)
         if args.no_mlp:
             b.mlp, b.ln_2 = ZeroMLP(), nn.Identity()
         if args.no_ln:
@@ -326,6 +351,8 @@ def main():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--d_model", type=int, default=768)
     p.add_argument("--n_heads", type=int, default=8)
+    p.add_argument("--d_head", type=int, default=None, help="default d_model / n_heads")
+    p.add_argument("--d_mlp", type=int, default=None, help="MLP hidden width; default 4 * d_model")
     p.add_argument("--ctx", type=int, default=1024)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=2.5e-4)
@@ -335,11 +362,12 @@ def main():
     p.add_argument("--data_tokens", type=int, default=110_000_000, help="how much CC100 to prepare")
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--val_rows", type=int, default=32)
-    p.add_argument("--ckpt_mtokens", default="5,10,20,30,40,50,60,80,100",
-                   help="save weights after these many million tokens (and at the end)")
+    p.add_argument("--ckpt_mtokens", default=None,
+                   help="save weights after these many million tokens (and at the end); without "
+                        "--ckpt_phases the default is 5,10,20,30,40,50,60,80,100")
     p.add_argument("--ckpt_phases", default=None,
-                   help="instead of --ckpt_mtokens: three induction-score thresholds, e.g. 0.03,0.1,0.25, "
-                        "giving pre-formation, onset and mid-transition checkpoints (plus the end)")
+                   help="three induction-score thresholds, e.g. 0.03,0.1,0.25, giving pre-formation, onset "
+                        "and mid-transition checkpoints (plus the end, and any --ckpt_mtokens milestones)")
     p.add_argument("--latest_mtokens", type=float, default=5,
                    help="with --ckpt_phases: how often the pre-formation candidate is overwritten")
     p.add_argument("--seed", type=int, default=1)
@@ -357,7 +385,10 @@ def main():
         print("note: --arch mine has no MLP, LayerNorm or dropout; --no_mlp, --no_ln and --dropout are ignored")
 
     tag = args.arch + ("-nomlp" if args.no_mlp else "") + ("-noln" if args.no_ln else "") \
-        + (f"-drop{args.dropout:g}" if args.arch == "gpt2" and args.dropout != 0.1 else "")
+        + (f"-drop{args.dropout:g}" if args.arch == "gpt2" and args.dropout != 0.1 else "") \
+        + (f"-h{args.n_heads}x{args.d_head or args.d_model // args.n_heads}"
+           if args.n_heads != 8 or args.d_head else "") \
+        + (f"-mlp{args.d_mlp}" if args.d_mlp else "")
     run_name = args.run_name or f"rep_{tag}_L{args.n_layers}x{args.n_loops}_b{args.batch_size}_c{args.ctx}_s{args.seed}"
     run_dir = CKPT_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -391,10 +422,11 @@ def main():
         pre, onset, mid = (float(x) for x in args.ckpt_phases.split(","))
         phaser = PhaseCheckpointer(pre, {"onset": onset, "mid-transition": mid},
                                    int(args.latest_mtokens * 1e6 // tokens_per_step))
-        ckpt_steps = {max_steps}
+        milestones = args.ckpt_mtokens or ""
     else:
         phaser = None
-        ckpt_steps = {int(float(m) * 1e6 // tokens_per_step) for m in args.ckpt_mtokens.split(",")} | {max_steps}
+        milestones = args.ckpt_mtokens or "5,10,20,30,40,50,60,80,100"
+    ckpt_steps = {int(float(m) * 1e6 // tokens_per_step) for m in milestones.split(",") if m} | {max_steps}
     phases = {}   # label -> step, written to phases.json
 
     def save(path):
@@ -435,7 +467,8 @@ def main():
         if step in ckpt_steps:
             save(run_dir / f"step_{step:06d}.pt")
             if phaser:
-                record("end", step)
+                record("end" if step == max_steps else f"{step * tokens_per_step / 1e6:.0f}M", step)
+            if phaser and step == max_steps:
                 (run_dir / "latest.pt").unlink(missing_ok=True)   # never needed: no crossing happened
         if step == max_steps:
             break
