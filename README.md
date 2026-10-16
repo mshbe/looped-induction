@@ -8,6 +8,7 @@
 
 These charts show mean attention of a particular head towards the "correct" token over the course of the training run. That is, the token the head should attend to if it is an induction head.
 
-We examined attention patterns for the models, using sequences of the form (25 random tokens, the same 25 random tokens). We see that in the tied-weight model, there is a previous-token head in Layer 0, and an induction head in Layer 1 (if AB appeared before, at later appearances of A, the head attends to the previous appearance of B). This is analogous to the non-tied situation.
+We also see the characteristic induction-circuit attention patterns in the tied model. With input (random tokens, same random tokens), there is a previous-token attention head in Layer 0 and an induction head in Layer 1.
 
 **Insert figure here**
+
