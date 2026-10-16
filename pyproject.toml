@@ -1,7 +1,7 @@
 [project]
 name = "looped-induction"
 version = "0.1.0"
-description = "Add your description here"
+description = "induction head formation in looped models"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,9 +16,3 @@ dependencies = [
     "transformer-lens>=2.16,<3",
 ]
 
-[project.scripts]
-looped-induction = "looped_induction:main"
-
-[build-system]
-requires = ["uv_build>=0.12.7,<0.13.0"]
-build-backend = "uv_build"

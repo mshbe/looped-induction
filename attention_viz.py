@@ -8,6 +8,7 @@
 # i = loop * n_layers + layer. Labels below read "loop{loop}.L{layer}.H{head}".
 
 # %%
+import json
 from pathlib import Path
 
 import circuitsvis as cv
@@ -15,12 +16,12 @@ import plotly.graph_objects as go
 import torch as t
 
 from convert import load_run, to_hooked
-from training import make_repeated_tokens
+from training import common_token_ids, load_val_tokens, make_repeated_tokens
 
 FIG_DIR = Path("figures")
 FIG_DIR.mkdir(exist_ok=True)
 
-RUN = "checkpoints/L1_loops2_seed0_20k"   # change to the run you want to look at
+RUN = "checkpoints/ts_L1_loops2_seed0"   # change to the run you want to look at
 STEP = None                            # None = latest checkpoint
 
 cfg, model = load_run(RUN, STEP)
@@ -37,8 +38,14 @@ def block_label(i: int) -> str:
 # ## Inputs: a stretch of real text, and repeated random tokens
 
 # %%
-text_tokens = t.load(Path("data") / f"pile10k_ctx{cfg.n_ctx}.pt")[-1:]   # one held-out row
-rep_tokens = make_repeated_tokens(tl_model.tokenizer.bos_token_id, cfg.d_vocab, half_len, batch=16)
+val_tokens = load_val_tokens(tl_model.tokenizer, cfg.n_ctx).long()
+text_tokens = val_tokens[:1]   # one validation row (never seen in training)
+
+# random tokens for the repeated sequences come from the same common-token set used in training
+train_args = json.loads((Path(RUN) / "train_args.json").read_text())
+rep_ids = common_token_ids(val_tokens, cfg.d_vocab, train_args.get("rep_vocab_size", 2000),
+                           tl_model.tokenizer.all_special_ids)
+rep_tokens = make_repeated_tokens(tl_model.tokenizer.bos_token_id, rep_ids, half_len, batch=16)
 
 _, text_cache = tl_model.run_with_cache(text_tokens)
 _, rep_cache = tl_model.run_with_cache(rep_tokens)
@@ -109,7 +116,7 @@ show_block(text_cache, text_str, 1, "text")
 # %%
 # A short repeated sequence just for display: BOS + 20 random tokens + the same 20 again.
 # An induction head shows a stripe 19 positions below the main diagonal in the second half.
-short_rep = make_repeated_tokens(tl_model.tokenizer.bos_token_id, cfg.d_vocab, 20, batch=1)
+short_rep = make_repeated_tokens(tl_model.tokenizer.bos_token_id, rep_ids, 20, batch=1)
 _, short_rep_cache = tl_model.run_with_cache(short_rep)
 short_rep_str = tl_model.to_str_tokens(short_rep[0])
 show_block(short_rep_cache, short_rep_str, n_blocks - 1, "repeated", n_show=41)

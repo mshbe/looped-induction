@@ -20,6 +20,7 @@ import torch as t
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 
 from model import Config, LoopedAttnOnly
+from training import load_val_tokens
 
 
 # ---------------------------------------------------------------- loading 
@@ -122,8 +123,8 @@ if __name__ == "__main__":
     cfg, model = load_run(run_dir)
     tl_model = to_hooked(model)
 
-    # a few rows of real text from the cached training data, plus some random tokens
-    text = t.load(Path("data") / f"pile10k_ctx{cfg.n_ctx}.pt")[:4]
+    # a few rows of real text from the TinyStories validation data, plus some random tokens
+    text = load_val_tokens(tl_model.tokenizer, cfg.n_ctx)[:4].long()
     rand = t.randint(0, cfg.d_vocab, (4, cfg.n_ctx))
     check_conversion(model, tl_model, text)
     check_conversion(model, tl_model, rand)

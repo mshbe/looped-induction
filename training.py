@@ -1,12 +1,15 @@
-"""Train a looped attention-only transformer on text (NeelNanda/pile-10k).
+"""Train a looped attention-only transformer on TinyStories (roneneldan/TinyStories).
 
 Run from the project folder, e.g.:
-    uv run python training.py --max_steps 30 --run_name smoke     # quick test
+    uv run python training.py --max_steps 30 --n_train_stories 5000 --run_name smoke   # quick test
     uv run python training.py --n_layers 1 --n_loops 2 --seed 0   # looped model
     uv run python training.py --n_layers 1 --n_loops 1 --seed 0   # 1-layer control
     uv run python training.py --n_layers 2 --n_loops 1 --seed 0 --device=cpu   # 2-layer control
 
-    uv run python training.py --max_steps 20000 --n_layers 1 --n_loops 2 --seed 0 --run_name L1_loops2_seed0_20k --ckpt_every 1000     # extensive test
+    uv run python training.py --max_steps 20000 --n_layers 1 --n_loops 2 --seed 0 --run_name ts_L1_loops2_seed0_20k --ckpt_every 1000     # extensive test
+
+Default run names start with ts_ (TinyStories), so they don't overwrite the earlier pile-10k runs.
+The first run downloads and tokenizes the data (a few minutes); later runs reuse the files in data/.
 
 Each run writes to checkpoints/<run_name>/:
     config.json      the model Config
@@ -23,12 +26,13 @@ from pathlib import Path
 
 import torch as t
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from transformer_lens.utils import tokenize_and_concatenate
 from transformers import AutoTokenizer
 
 from model import Config, LoopedAttnOnly
 
+DATASET = "roneneldan/TinyStories"
 DATA_DIR = Path("data")
 CKPT_DIR = Path("checkpoints")
 
@@ -45,22 +49,58 @@ def get_device(name: str | None) -> t.device:
     return t.device("cpu")
 
 
-def load_tokens(tokenizer, n_ctx: int) -> t.Tensor:
-    """Return pile-10k as a [n_rows, n_ctx] tensor of token ids, each row starting with BOS.
-
-    Tokenizing takes a few minutes, so the result is saved to data/ and reused on later runs.
+def _tokenize(dataset, tokenizer, n_ctx: int) -> t.Tensor:
+    """Join the stories end to end (separated by an end-of-text token) and cut the result into
+    rows of n_ctx tokens, each starting with BOS. A row can span the end of one story and the
+    start of the next. Stored as int32 to halve the file size; convert with .long() before use.
     """
-    path = DATA_DIR / f"pile10k_ctx{n_ctx}.pt"
-    if path.exists():
-        return t.load(path)
-    dataset = load_dataset("NeelNanda/pile-10k", split="train")
     tokenized = tokenize_and_concatenate(
         dataset, tokenizer, max_length=n_ctx, add_bos_token=True, num_proc=4
     )
-    tokens = tokenized.with_format("torch")[:]["tokens"]
+    return tokenized.with_format("torch")[:]["tokens"].to(t.int32)
+
+
+def load_train_tokens(tokenizer, n_ctx: int, n_stories: int) -> t.Tensor:
+    """The first n_stories TinyStories training stories, as a [n_rows, n_ctx] int32 tensor.
+
+    Streaming downloads only the stories needed, not all 2.1M. The result is saved to data/
+    and reused on later runs with the same n_stories and n_ctx.
+    """
+    path = DATA_DIR / f"tinystories_train{n_stories}_ctx{n_ctx}.pt"
+    if path.exists():
+        return t.load(path)
+    stream = load_dataset(DATASET, split="train", streaming=True)
+    dataset = Dataset.from_list(list(stream.take(n_stories)))
+    tokens = _tokenize(dataset, tokenizer, n_ctx)
     DATA_DIR.mkdir(exist_ok=True)
     t.save(tokens, path)
     return tokens
+
+
+def load_val_tokens(tokenizer, n_ctx: int) -> t.Tensor:
+    """TinyStories' separate validation split (~22k stories), same format as load_train_tokens."""
+    path = DATA_DIR / f"tinystories_val_ctx{n_ctx}.pt"
+    if path.exists():
+        return t.load(path)
+    dataset = load_dataset(DATASET, split="validation")
+    tokens = _tokenize(dataset, tokenizer, n_ctx)
+    DATA_DIR.mkdir(exist_ok=True)
+    t.save(tokens, path)
+    return tokens
+
+
+def common_token_ids(tokens: t.Tensor, d_vocab: int, k: int, exclude: list[int]) -> t.Tensor:
+    """The k most frequent token ids in `tokens`, leaving out `exclude` (special tokens like BOS).
+
+    The repeated-token test draws its random tokens from these. TinyStories uses only a small
+    part of the tokenizer's ~50k-token vocabulary.
+    """
+    flat = tokens.flatten().long()
+    counts = t.bincount(flat, minlength=max(d_vocab, int(flat.max()) + 1))[:d_vocab]
+    for i in exclude:
+        if i < d_vocab:
+            counts[i] = 0
+    return counts.topk(k).indices.sort().values
 
 
 def lr_at(step: int, args) -> float:
@@ -81,10 +121,11 @@ def per_token_loss(logits: t.Tensor, tokens: t.Tensor) -> t.Tensor:
     ).view(batch, seq - 1)
 
 
-def make_repeated_tokens(bos_id: int, d_vocab: int, half_len: int, batch: int) -> t.Tensor:
-    """[BOS, r_1..r_L, r_1..r_L] with random r_i. Fixed seed, so every evaluation uses the same batch."""
+def make_repeated_tokens(bos_id: int, token_ids: t.Tensor, half_len: int, batch: int) -> t.Tensor:
+    """[BOS, r_1..r_L, r_1..r_L] with each r_i drawn at random from token_ids (see common_token_ids).
+    Fixed seed, so every evaluation uses the same batch."""
     g = t.Generator().manual_seed(1234)
-    rand = t.randint(0, d_vocab, (batch, half_len), generator=g)
+    rand = token_ids[t.randint(0, len(token_ids), (batch, half_len), generator=g)]
     bos = t.full((batch, 1), bos_id)
     return t.cat([bos, rand, rand], dim=1)
 
@@ -96,10 +137,10 @@ def evaluate(model, val_tokens, rep_tokens, half_len, args, device) -> dict:
     # held-out text loss
     losses = []
     for i in range(args.val_batches):
-        batch = val_tokens[i * args.batch_size : (i + 1) * args.batch_size].to(device)
+        batch = val_tokens[i * args.batch_size : (i + 1) * args.batch_size].to(device).long()
         losses.append(per_token_loss(model(batch), batch).mean().item())
 
-    # repeated random tokens: first copy is unpredictable (loss ~ ln d_vocab);
+    # repeated random tokens: first copy is unpredictable (loss at least ~ ln rep_vocab_size);
     # the second copy can be predicted by induction. Loss index i predicts token i+1.
     # Index half_len predicts r_1 from r_L, which induction can't do, so the second half starts at half_len+1.
     rep = rep_tokens.to(device)
@@ -132,14 +173,18 @@ def main():
     p.add_argument("--ckpt_every", type=int, default=500)
     p.add_argument("--device", default=None, help="mps, cpu, or cuda (default: best available)")
     p.add_argument("--run_name", default=None)
+    p.add_argument("--n_train_stories", type=int, default=300_000,
+                   help="how many TinyStories training stories to use (~2.1M available)")
+    p.add_argument("--rep_vocab_size", type=int, default=2000,
+                   help="repeated-token test draws from this many of the most common tokens")
     args = p.parse_args()
 
-    run_name = args.run_name or f"L{args.n_layers}_loops{args.n_loops}_seed{args.seed}"
+    run_name = args.run_name or f"ts_L{args.n_layers}_loops{args.n_loops}_seed{args.seed}"
     run_dir = CKPT_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     device = get_device(args.device)
 
-    # tokenizer and config. d_vocab is read before load_tokens, which may add a padding
+    # tokenizer and config. d_vocab is read before loading the data, which may add a padding
     # token to the tokenizer; padding never appears in the training data.
     cfg = Config(n_layers=args.n_layers, n_loops=args.n_loops)
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
@@ -147,12 +192,12 @@ def main():
     (run_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
     (run_dir / "train_args.json").write_text(json.dumps(vars(args), indent=2))
 
-    # data: hold out the last 2% of rows for validation
-    tokens = load_tokens(tokenizer, cfg.n_ctx)
-    n_val = max(args.val_batches * args.batch_size, len(tokens) // 50)
-    train_tokens, val_tokens = tokens[:-n_val], tokens[-n_val:]
+    # data: TinyStories has a separate validation split, so nothing is held out of train
+    train_tokens = load_train_tokens(tokenizer, cfg.n_ctx, args.n_train_stories)
+    val_tokens = load_val_tokens(tokenizer, cfg.n_ctx)
     half_len = (cfg.n_ctx - 1) // 2
-    rep_tokens = make_repeated_tokens(tokenizer.bos_token_id, cfg.d_vocab, half_len, args.batch_size)
+    rep_ids = common_token_ids(val_tokens, cfg.d_vocab, args.rep_vocab_size, tokenizer.all_special_ids)
+    rep_tokens = make_repeated_tokens(tokenizer.bos_token_id, rep_ids, half_len, args.batch_size)
     print(f"{len(train_tokens)} training rows of {cfg.n_ctx} tokens "
           f"(~{len(train_tokens) // args.batch_size} steps per pass through the data)")
 
@@ -184,7 +229,7 @@ def main():
 
         # one training step on a random batch (sampled with replacement)
         idx = t.randint(0, len(train_tokens), (args.batch_size,), generator=data_gen)
-        batch = train_tokens[idx].to(device)
+        batch = train_tokens[idx].to(device).long()
         loss = per_token_loss(model(batch), batch).mean()
 
         for group in optimizer.param_groups:
