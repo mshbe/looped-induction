@@ -9,6 +9,11 @@ Run from the project folder, e.g.:
     uv run python training.py --max_steps 20000 --n_layers 1 --n_loops 2 --seed 0 --run_name ts_L1_loops2_seed0_20k --ckpt_every 1000     # extensive test
 
 Default run names start with ts_ (TinyStories), so they don't overwrite the earlier pile-10k runs.
+
+Sanity check with synthetic data (repeated random segments, see make_synthetic_batch):
+    uv run python training.py --data synthetic --n_layers 2 --n_loops 1 --max_steps 3000 --batch_size 32
+Run names then start with syn_. val_loss is still measured on TinyStories, so it stays high; watch
+the repeated-token numbers instead.
 The first run downloads and tokenizes the data (a few minutes); later runs reuse the files in data/.
 
 Each run writes to checkpoints/<run_name>/:
@@ -130,6 +135,25 @@ def make_repeated_tokens(bos_id: int, token_ids: t.Tensor, half_len: int, batch:
     return t.cat([bos, rand, rand], dim=1)
 
 
+def make_synthetic_batch(bos_id: int, token_ids: t.Tensor, n_ctx: int, batch: int,
+                         gen: t.Generator, min_len: int = 8) -> t.Tensor:
+    """Synthetic training data: each row is BOS, then a random segment repeated until the row is full.
+
+    The segment length L is drawn per row from [min_len, (n_ctx-1)//2], so a model can't solve the
+    task by always attending a fixed distance back (a 1-layer model could do that). Copying has to
+    be content-based: find the earlier occurrence of the current token, predict what followed it.
+    That is what an induction head does, and a 1-layer model shouldn't manage it.
+    """
+    max_len = (n_ctx - 1) // 2
+    rows = []
+    for _ in range(batch):
+        L = int(t.randint(min_len, max_len + 1, (1,), generator=gen))
+        seg = token_ids[t.randint(0, len(token_ids), (L,), generator=gen)]
+        n_rep = -(-(n_ctx - 1) // L)   # ceiling division
+        rows.append(seg.repeat(n_rep)[: n_ctx - 1])
+    return t.cat([t.full((batch, 1), bos_id), t.stack(rows)], dim=1)
+
+
 @t.no_grad()
 def evaluate(model, val_tokens, rep_tokens, half_len, args, device) -> dict:
     model.eval()
@@ -173,13 +197,16 @@ def main():
     p.add_argument("--ckpt_every", type=int, default=500)
     p.add_argument("--device", default=None, help="mps, cpu, or cuda (default: best available)")
     p.add_argument("--run_name", default=None)
+    p.add_argument("--data", choices=["tinystories", "synthetic"], default="tinystories",
+                   help="synthetic = repeated random segments, a sanity check that induction can form")
     p.add_argument("--n_train_stories", type=int, default=300_000,
                    help="how many TinyStories training stories to use (~2.1M available)")
     p.add_argument("--rep_vocab_size", type=int, default=2000,
                    help="repeated-token test draws from this many of the most common tokens")
     args = p.parse_args()
 
-    run_name = args.run_name or f"ts_L{args.n_layers}_loops{args.n_loops}_seed{args.seed}"
+    prefix = "ts" if args.data == "tinystories" else "syn"
+    run_name = args.run_name or f"{prefix}_L{args.n_layers}_loops{args.n_loops}_seed{args.seed}"
     run_dir = CKPT_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     device = get_device(args.device)
@@ -193,13 +220,16 @@ def main():
     (run_dir / "train_args.json").write_text(json.dumps(vars(args), indent=2))
 
     # data: TinyStories has a separate validation split, so nothing is held out of train
-    train_tokens = load_train_tokens(tokenizer, cfg.n_ctx, args.n_train_stories)
     val_tokens = load_val_tokens(tokenizer, cfg.n_ctx)
     half_len = (cfg.n_ctx - 1) // 2
     rep_ids = common_token_ids(val_tokens, cfg.d_vocab, args.rep_vocab_size, tokenizer.all_special_ids)
     rep_tokens = make_repeated_tokens(tokenizer.bos_token_id, rep_ids, half_len, args.batch_size)
-    print(f"{len(train_tokens)} training rows of {cfg.n_ctx} tokens "
-          f"(~{len(train_tokens) // args.batch_size} steps per pass through the data)")
+    if args.data == "tinystories":
+        train_tokens = load_train_tokens(tokenizer, cfg.n_ctx, args.n_train_stories)
+        print(f"{len(train_tokens)} training rows of {cfg.n_ctx} tokens "
+              f"(~{len(train_tokens) // args.batch_size} steps per pass through the data)")
+    else:
+        print(f"synthetic data: repeated random segments of {len(rep_ids)} common tokens")
 
     # model and optimizer
     t.manual_seed(args.seed)
@@ -227,9 +257,13 @@ def main():
         if step == args.max_steps:
             break
 
-        # one training step on a random batch (sampled with replacement)
-        idx = t.randint(0, len(train_tokens), (args.batch_size,), generator=data_gen)
-        batch = train_tokens[idx].to(device).long()
+        # one training step on a random batch (sampled with replacement, or generated fresh)
+        if args.data == "tinystories":
+            idx = t.randint(0, len(train_tokens), (args.batch_size,), generator=data_gen)
+            batch = train_tokens[idx].to(device).long()
+        else:
+            batch = make_synthetic_batch(tokenizer.bos_token_id, rep_ids, cfg.n_ctx,
+                                         args.batch_size, data_gen).to(device)
         loss = per_token_loss(model(batch), batch).mean()
 
         for group in optimizer.param_groups:
