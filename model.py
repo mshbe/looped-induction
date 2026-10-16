@@ -167,3 +167,4 @@ class LoopedAttnOnly(nn.Module):
             for block in self.blocks:
                 residual=block(residual, pos) 
         return self.unembed(residual)
+
