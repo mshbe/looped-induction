@@ -4,7 +4,7 @@
 This project investigates whether induction heads can form in weight-tied transformers with 2 layers with identical weights ("1 layer 2 loop" transformers). We use a GPT2-style model architecture. Induction heads are part of a relatively simple, very common 2-layer circuit which aids in bigram completion; that is, if AB appear early in input, and A appears later, induction heads boost B in the logits for A. Induction heads do not form in 1 layer transformers, but do form in 2 layer non-weight-tied transformers. We verify that induction heads do form in 1-layer 2-loop models, so what matters is passing through 2 layers total rather than having different weights in the layers. We also trace the induction circuit in both weight-tied and non-weight-tied models, and find the mechanism to be very similar.
 
 ## Results
-We trained a GPT2-style model with tied weights (45.5B parameters, 7B in transformer blocks) and with untied weights (54B parameters, 14B in transformer blocks) as control. In training, both the tied model and the control form induction heads:
+We trained a GPT2-style model with tied weights (45.5M parameters, 7M in transformer blocks) and with untied weights (54M parameters, 14M in transformer blocks) as control. In training, both the tied model and the control form induction heads:
 
 <img width="1700" height="952" alt="image" src="https://github.com/user-attachments/assets/ca327c30-c94f-4089-baa3-aa94912ea2e7" />
 
