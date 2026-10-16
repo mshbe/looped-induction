@@ -8,11 +8,11 @@ from torch import Tensor, nn
 
 @dataclass
 class Config:
-    d_model: int = 256
+    d_model: int = 512
     d_vocab: int = 50257
     init_range: float = 0.02
-    n_ctx: int = 256
-    d_head: int = 32
+    n_ctx: int = 512
+    d_head: int = 64
     n_heads: int = 8 #n_heads x d_head= d_model
     n_layers: int = 1 #number of distinct layers in stack
     n_loops: int = 2 #number of times model loops through the stack
