@@ -46,7 +46,7 @@ plots its attention patterns.
 | `circuits.py` | Loads a run as a TransformerLens model |
 | `analysis.ipynb` | Per-run analysis notebook |
 | `viz_replicate.py` | Attention-pattern plots |
-| `model.py`, `training.py`, `convert.py`, `attention_viz.py` | Earlier attention-only experiments |
+| in `attn_only`: `model.py`, `training.py`, `convert.py`, `attention_viz.py` | Earlier attention-only experiments |
 
 ## References
 
