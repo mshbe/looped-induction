@@ -8,11 +8,13 @@ We trained a GPT2-style model with tied weights (45.5M parameters, 7M in transfo
 
 <img width="1700" height="952" alt="image" src="https://github.com/user-attachments/assets/ca327c30-c94f-4089-baa3-aa94912ea2e7" />
 
-This plot shows mean attention of a particular head towards the "correct" token over the course of the training run. That is, the token the head should attend to if it is an induction head.
+This plot shows mean attention of a particular head towards the "correct" token over the course of the training run. That is, the token the head should attend to if it is an induction head. Induction head formation is slower and later for the tied weight model; this could possibly be resolved by hyperparameter tuning.
 
-We see the characteristic induction-circuit attention patterns in the tied mode with input (random tokens, same random tokens: a previous-token attention head in Layer 0 (attention on the subdiagonal) and an induction head in Layer 1 (once repeat starts, attention on the shifted subdiagonal).
+We see the characteristic induction-circuit attention patterns in the tied mode with input (random tokens, same random tokens repeated): a previous-token attention head in Layer 0 (attention on the subdiagonal) and an induction head in Layer 1 (once repeat starts, attention on the shifted subdiagonal).
 
 <img width="2380" height="1224" alt="image" src="https://github.com/user-attachments/assets/2a463c14-fa4f-4afe-83d4-e5a2edfe49b8" />
+
+We analyze the induction circuit for both tied and untied weight models and find that it functions by K-composition through the layer 0 MLP.
 
 ## Setup
 
